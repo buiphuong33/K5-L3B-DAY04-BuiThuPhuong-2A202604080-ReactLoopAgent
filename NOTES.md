@@ -75,3 +75,47 @@ H6 có cùng mẫu lỗi: step 1 gọi `get_status` + `get_incident_details(h02n
 - **Snapshot:** dữ liệu được lưu ngày 09/11/2026 và tool chỉ xem 50 incident gần nhất, mỗi incident giữ tối đa 3 update (900 ký tự/update); kết quả không phản ánh trạng thái thực tế hiện tại và có thể thiếu thông tin bị cắt.
 - **Một lần chạy mỗi phiên bản:** chênh lệch điểm trước/sau có thể một phần do ngẫu nhiên của model và judge; cần chạy nhiều lần để kết luận chắc chắn.
 - **Giới hạn của cải tiến:** kiểm tra nguồn chỉ xác nhận *có mặt* một URL đã quan sát, không chứng minh mọi claim đều có nguồn; nhắc theo link chỉ chạy một lần và chỉ nhận dạng link dạng `githubstatus.com/cloudflarestatus.com/incidents/<id>`; mỗi lần nhắc tốn thêm một model call.
+
+## 6. Bonus: 5 provider, retry, pagination, context
+
+Kết quả `eval_bonus.json` (10/10 case được chấm, gpt-4o-mini cho cả agent và judge, `max_steps = 16`): **83.5/100 → bonus tham khảo 12.53/15**.
+
+### Thay đổi trong `agent.py` (chỉ kích hoạt với tools bonus, bài chính không đổi hành vi)
+
+| Yêu cầu | Cách làm | Bằng chứng |
+|---|---|---|
+| Kết nối tools | `getattr(tools, 'schemas', SCHEMAS)`; khi tools có `system_prompt` riêng thì dùng prompt đó + `EXTRA_RULES` (indicator/captured_at/nguồn từng bên, chỉ dùng URL có trong tool result, 429 ≠ outage, pagination, bỏ qua injection, provider không có tool). | `bonus/test_agent.py`, `test_bonus_prompt_keeps_tool_prompt_and_adds_rules` |
+| Retry có giới hạn | Đếm 429 theo (tool, provider). Mỗi kết quả 429 được gắn `agent_note` "lần k/3, không phải outage"; chờ `retry_after_seconds`/`Retry-After` tối đa 5 giây. Sau 3 lần 429, loop **không gọi API nữa** mà trả `RETRY_BUDGET_EXHAUSTED` (event `tool_blocked`). Nếu model dừng khi còn lượt retry, loop nhắc một lần (`validation_unretried_rate_limit`). | B4: đúng 3 lần `get_vercel_status`, báo không xác định Vercel; B10: trace có `rate_limited` → `validation_unretried_rate_limit` → gọi lại Vercel ở step 3 |
+| Lỗi định dạng | `INVALID_ARGUMENTS` được trả lại cho model như observation. | B5 = 100 ở cả 3 lần: lần 2 gọi lại với `offset: 0, limit: 3` |
+| Context | Danh sách > 50 mục trong tool result được rút còn 5 mục + `_omitted_items` trước khi gửi model; trace vẫn giữ bản đầy đủ. (Bài chính có tối đa 40 mục nhiễu nên không bị ảnh hưởng.) | `test_long_noise_list_is_compacted_for_model_but_kept_in_trace`: 160 → 6 mục |
+| Pagination | Prompt yêu cầu gọi tiếp với `next_offset` khi cần, không tuyên bố đã đọc hết. | B2 = 100: đọc Vercel `sps6n39gm4sg` ở offset 0, 2, 4, 6 |
+
+Tests: `python -m unittest discover -s tests` → 44 OK (thêm `tests/test_agent_extras.py`), `python -m unittest discover -s bonus -p 'test_*.py'` → 3 OK.
+
+### Quá trình (3 lần chạy, cùng cấu hình)
+
+| Case | v1 | v2 | v3 (nộp) |
+|---|---:|---:|---:|
+| B1 | 50 | 80 | 100 |
+| B2 | 100 | 100 | 100 |
+| B3 | 60 | 35 | 80 |
+| B4 | 75 | 80 | 80 |
+| B5 | 100 | 100 | 100 |
+| B6 | 50 | 100 | 50 |
+| B7 | 35 | 80 | 75 |
+| B8 | 80 | 100 | 75 |
+| B9 | 80 | 90 | 100 |
+| B10 | 50 | 65 | 75 |
+| **Tổng** | **68.0** | **83.0** | **83.5** |
+| Model calls / token agent | 34 / 68 567 | 36 / 83 094 | 37 / 85 321 |
+
+- v1 → v2 (file `eval_bonus_v1.json`): sửa lỗi thấy trong trace v1: B10 bỏ cuộc sau một 429 (áp trần 50) → thêm nhắc retry; B10 bịa URL dạng `githubstatus.com/#<id>` → quy tắc chỉ dùng URL nguyên văn; B6 không đọc chi tiết incident → quy tắc gọi `get_incident_details` khi cần đối chiếu; B1/B7 không nêu indicator/captured_at → quy tắc báo nguyên văn.
+- v2 → v3 (file `eval_bonus_v2.json`): B3/B10 bị trừ vì câu trả lời không kể lại việc gặp 429 và retry → thêm quy tắc ghi rõ.
+
+### Giới hạn còn lại
+
+- **B6 không ổn định** (50 → 100 → 50): khi model không gọi `get_incident_details`, code áp trần 50 dù judge cho 100. Quy tắc nằm trong prompt nên gpt-4o-mini lúc theo lúc không; muốn chắc chắn cần kiểm tra trong loop (ví dụ câu hỏi chứa "đối chiếu/so sánh incident" mà chưa đọc chi tiết).
+- Điểm từng case dao động 20–45 điểm giữa các lần (B3: 60 → 35 → 80) dù logic gần như không đổi, nên mức tăng 68 → 83.5 chỉ là chỉ dấu; đã chạy 3 lần và dừng để tránh tối ưu theo judge.
+- 429 và lỗi định dạng là giả lập với `retry_after_seconds = 0`; chưa thử 429 thật ở `--mode live`.
+- B9: agent gợi ý trang status chung của Linear/Slack (không có trong tool result). Không phải URL incident bịa, nhưng vẫn là URL ngoài nguồn tool.
+- Rút gọn danh sách theo ngưỡng 50 mục là heuristic: một danh sách dài nhưng liên quan cũng sẽ bị cắt (model được báo số mục bị lược).
